@@ -3,20 +3,18 @@ import psycopg2
 import json
 import numpy as np
 import cv2
+import face_recognition # MUDANÇA: Importar a nova biblioteca
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from deepface import DeepFace
 from dotenv import load_dotenv
 
 load_dotenv()
 
 app = Flask(__name__)
+# Deixando o CORS mais aberto para testes, pode ser restringido depois se necessário
+CORS(app)
 
-# --- CORREÇÃO DO CORS ---
-# Em vez de CORS(app), usamos uma configuração mais específica
-CORS(app, resources={r"/api/*": {"origins": "https://facial-recognition-ns70umti6-rafaels-fs-projects.vercel.app"}})
-# -------------------------
-
+# --- O código do banco de dados permanece o mesmo ---
 def get_db_connection():
     try:
         conn = psycopg2.connect(os.getenv('DATABASE_URL'))
@@ -42,18 +40,19 @@ def create_table():
         conn.close()
         print("Tabela 'passengers' verificada/criada com sucesso.")
 
+# MUDANÇA: O NumpyEncoder não é mais estritamente necessário, mas podemos manter por segurança
 class NumpyEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, np.ndarray):
             return obj.tolist()
-        if isinstance(obj, np.float32):
-            return float(obj)
         return json.JSONEncoder.default(self, obj)
 
 def process_image_in_memory(photo_file):
     file_bytes = np.fromfile(photo_file, np.uint8)
     img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-    return img
+    # MUDANÇA: face_recognition espera cores RGB, enquanto OpenCV lê em BGR. Precisamos converter.
+    rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    return rgb_img
 
 @app.route('/api/register', methods=['POST'])
 def register_passenger():
@@ -66,8 +65,16 @@ def register_passenger():
 
     try:
         img = process_image_in_memory(photo)
-        embedding_objs = DeepFace.represent(img_path=img, model_name='Facenet512', enforce_detection=True)
-        embedding = embedding_objs[0]['embedding']
+        
+        # MUDANÇA: Lógica de representação com face_recognition
+        # Retorna uma lista de encodings (um para cada rosto na imagem)
+        face_encodings = face_recognition.face_encodings(img)
+
+        if len(face_encodings) == 0:
+            return jsonify({"error": "Nenhum rosto encontrado na imagem."}), 400
+        
+        # Pega o encoding do primeiro rosto encontrado
+        embedding = face_encodings[0]
         embedding_json = json.dumps(embedding, cls=NumpyEncoder)
 
         conn = get_db_connection()
@@ -84,8 +91,6 @@ def register_passenger():
 
         return jsonify({"message": f"Passageiro {name} registrado com sucesso!"}), 201
 
-    except ValueError as e:
-        return jsonify({"error": f"Não foi possível detectar um rosto na imagem: {e}"}), 400
     except Exception as e:
         print(f"Erro inesperado: {e}")
         return jsonify({"error": f"Ocorreu um erro interno: {e}"}), 500
@@ -100,13 +105,15 @@ def verify_passenger():
     
     try:
         live_img = process_image_in_memory(photo)
+        live_encodings = face_recognition.face_encodings(live_img)
+
+        if len(live_encodings) == 0:
+            return jsonify({"error": "Nenhum rosto encontrado na imagem para verificação."}), 400
+        
+        live_embedding = live_encodings[0]
 
         conn = get_db_connection()
-        if not conn:
-            return jsonify({"error": "Falha na conexão com o banco de dados"}), 500
-            
-        db_embedding = None
-        passenger_name = None
+        # ... (código para buscar dados no banco continua o mesmo)
         with conn.cursor() as cur:
             cur.execute("SELECT name, embedding FROM passengers WHERE document_id = %s", (document_id,))
             result = cur.fetchone()
@@ -116,27 +123,24 @@ def verify_passenger():
                 return jsonify({"error": "Passageiro não encontrado"}), 404
         conn.close()
 
-        live_embedding_objs = DeepFace.represent(img_path=live_img, model_name='Facenet512', enforce_detection=True)
-        live_embedding = live_embedding_objs[0]['embedding']
-        
-        result = DeepFace.verify(
-            img1_path=live_embedding, 
-            img2_path=db_embedding, 
-            model_name='Facenet512',
-            distance_metric='cosine'
-        )
+        # MUDANÇA: Lógica de verificação com face_recognition
+        # `compare_faces` retorna uma lista de True/False
+        matches = face_recognition.compare_faces([db_embedding], live_embedding, tolerance=0.6)
+        verified = matches[0]
 
-        similarity_percentage = (1 - result['distance']) * 100
+        # `face_distance` nos dá um valor numérico para a similaridade
+        # Distância menor = mais parecido. 0 é idêntico.
+        distance = face_recognition.face_distance([db_embedding], live_embedding)[0]
+        # Convertendo distância para uma porcentagem de similaridade (forma simples)
+        similarity_percentage = (1 - distance) * 100
 
         return jsonify({
-            "verified": result['verified'],
+            "verified": bool(verified), # Converte de numpy.bool_ para bool nativo
             "similarity_percentage": f"{similarity_percentage:.2f}%",
             "passenger_name": passenger_name,
             "document_id": document_id
         }), 200
 
-    except ValueError as e:
-        return jsonify({"error": f"Não foi possível detectar um rosto na imagem: {e}"}), 400
     except Exception as e:
         print(f"Erro inesperado na verificação: {e}")
         return jsonify({"error": f"Ocorreu um erro interno na verificação: {e}"}), 500
