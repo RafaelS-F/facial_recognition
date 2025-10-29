@@ -2,19 +2,21 @@ import os
 import psycopg2
 import json
 import numpy as np
-import cv2  # Importa a biblioteca OpenCV
+import cv2
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from deepface import DeepFace
 from dotenv import load_dotenv
 
-# Carregar variáveis de ambiente do arquivo .env
 load_dotenv()
 
 app = Flask(__name__)
-CORS(app)
 
-# --- Configuração do Banco de Dados Neon Tech ---
+# --- CORREÇÃO DO CORS ---
+# Em vez de CORS(app), usamos uma configuração mais específica
+CORS(app, resources={r"/api/*": {"origins": "https://facial-recognition-ns70umti6-rafaels-fs-projects.vercel.app"}})
+# -------------------------
+
 def get_db_connection():
     try:
         conn = psycopg2.connect(os.getenv('DATABASE_URL'))
@@ -23,7 +25,6 @@ def get_db_connection():
         print(f"Erro ao conectar ao banco de dados: {e}")
         return None
 
-# --- Função para criar a tabela se ela não existir ---
 def create_table():
     conn = get_db_connection()
     if conn:
@@ -41,7 +42,6 @@ def create_table():
         conn.close()
         print("Tabela 'passengers' verificada/criada com sucesso.")
 
-# --- Helpers ---
 class NumpyEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, np.ndarray):
@@ -50,16 +50,10 @@ class NumpyEncoder(json.JSONEncoder):
             return float(obj)
         return json.JSONEncoder.default(self, obj)
 
-# --- Função para processar imagem em memória ---
 def process_image_in_memory(photo_file):
-    # Lê os bytes do arquivo enviado
     file_bytes = np.fromfile(photo_file, np.uint8)
-    # Decodifica os bytes em uma imagem colorida
     img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-    # O DeepFace espera BGR, e o OpenCV já lê nesse formato.
     return img
-
-# --- Rotas da API ---
 
 @app.route('/api/register', methods=['POST'])
 def register_passenger():
@@ -71,9 +65,7 @@ def register_passenger():
     photo = request.files['photo']
 
     try:
-        # Processa a imagem diretamente na memória
         img = process_image_in_memory(photo)
-
         embedding_objs = DeepFace.represent(img_path=img, model_name='Facenet512', enforce_detection=True)
         embedding = embedding_objs[0]['embedding']
         embedding_json = json.dumps(embedding, cls=NumpyEncoder)
@@ -95,7 +87,6 @@ def register_passenger():
     except ValueError as e:
         return jsonify({"error": f"Não foi possível detectar um rosto na imagem: {e}"}), 400
     except Exception as e:
-        # Para depuração, é útil logar o erro no servidor
         print(f"Erro inesperado: {e}")
         return jsonify({"error": f"Ocorreu um erro interno: {e}"}), 500
 
@@ -108,7 +99,6 @@ def verify_passenger():
     photo = request.files['photo']
     
     try:
-        # Processa a imagem da verificação em memória
         live_img = process_image_in_memory(photo)
 
         conn = get_db_connection()
@@ -152,6 +142,5 @@ def verify_passenger():
         return jsonify({"error": f"Ocorreu um erro interno na verificação: {e}"}), 500
 
 if __name__ == '__main__':
-    # A pasta 'uploads' não é mais necessária para a lógica principal
     create_table()
     app.run(host='0.0.0.0', port=5001, debug=True)
