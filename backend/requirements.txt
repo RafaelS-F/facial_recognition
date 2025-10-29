@@ -1,0 +1,8 @@
+Flask
+Flask-Cors
+psycopg2-binary
+deepface
+numpy
+opencv-python
+gunicorn
+python-dotenv
