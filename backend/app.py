@@ -2,6 +2,7 @@ import os
 import psycopg2
 import json
 import numpy as np
+import cv2  # Importa a biblioteca OpenCV
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from deepface import DeepFace
@@ -11,7 +12,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 app = Flask(__name__)
-CORS(app) # Habilita o CORS para permitir requisições do frontend
+CORS(app)
 
 # --- Configuração do Banco de Dados Neon Tech ---
 def get_db_connection():
@@ -42,13 +43,21 @@ def create_table():
 
 # --- Helpers ---
 class NumpyEncoder(json.JSONEncoder):
-    """ Encoder especial para converter arrays NumPy em listas para JSON """
     def default(self, obj):
         if isinstance(obj, np.ndarray):
             return obj.tolist()
         if isinstance(obj, np.float32):
             return float(obj)
         return json.JSONEncoder.default(self, obj)
+
+# --- Função para processar imagem em memória ---
+def process_image_in_memory(photo_file):
+    # Lê os bytes do arquivo enviado
+    file_bytes = np.fromfile(photo_file, np.uint8)
+    # Decodifica os bytes em uma imagem colorida
+    img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+    # O DeepFace espera BGR, e o OpenCV já lê nesse formato.
+    return img
 
 # --- Rotas da API ---
 
@@ -61,11 +70,11 @@ def register_passenger():
     document_id = request.form['document_id']
     photo = request.files['photo']
 
-    temp_path = os.path.join("uploads", photo.filename)
-    photo.save(temp_path)
-
     try:
-        embedding_objs = DeepFace.represent(img_path=temp_path, model_name='Facenet512', enforce_detection=True)
+        # Processa a imagem diretamente na memória
+        img = process_image_in_memory(photo)
+
+        embedding_objs = DeepFace.represent(img_path=img, model_name='Facenet512', enforce_detection=True)
         embedding = embedding_objs[0]['embedding']
         embedding_json = json.dumps(embedding, cls=NumpyEncoder)
 
@@ -86,11 +95,9 @@ def register_passenger():
     except ValueError as e:
         return jsonify({"error": f"Não foi possível detectar um rosto na imagem: {e}"}), 400
     except Exception as e:
-        return jsonify({"error": f"Ocorreu um erro: {e}"}), 500
-    finally:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-
+        # Para depuração, é útil logar o erro no servidor
+        print(f"Erro inesperado: {e}")
+        return jsonify({"error": f"Ocorreu um erro interno: {e}"}), 500
 
 @app.route('/api/verify', methods=['POST'])
 def verify_passenger():
@@ -100,10 +107,10 @@ def verify_passenger():
     document_id = request.form['document_id']
     photo = request.files['photo']
     
-    temp_path = os.path.join("uploads", photo.filename)
-    photo.save(temp_path)
-
     try:
+        # Processa a imagem da verificação em memória
+        live_img = process_image_in_memory(photo)
+
         conn = get_db_connection()
         if not conn:
             return jsonify({"error": "Falha na conexão com o banco de dados"}), 500
@@ -114,15 +121,12 @@ def verify_passenger():
             cur.execute("SELECT name, embedding FROM passengers WHERE document_id = %s", (document_id,))
             result = cur.fetchone()
             if result:
-                passenger_name, db_embedding_json = result
-                # --- ESTA É A LINHA CORRIGIDA ---
-                # O psycopg2 já retorna uma lista Python do JSONB, que é o formato ideal
-                db_embedding = db_embedding_json
+                passenger_name, db_embedding = result
             else:
                 return jsonify({"error": "Passageiro não encontrado"}), 404
         conn.close()
 
-        live_embedding_objs = DeepFace.represent(img_path=temp_path, model_name='Facenet512', enforce_detection=True)
+        live_embedding_objs = DeepFace.represent(img_path=live_img, model_name='Facenet512', enforce_detection=True)
         live_embedding = live_embedding_objs[0]['embedding']
         
         result = DeepFace.verify(
@@ -144,14 +148,10 @@ def verify_passenger():
     except ValueError as e:
         return jsonify({"error": f"Não foi possível detectar um rosto na imagem: {e}"}), 400
     except Exception as e:
-        return jsonify({"error": f"Ocorreu um erro: {e}"}), 500
-    finally:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-
+        print(f"Erro inesperado na verificação: {e}")
+        return jsonify({"error": f"Ocorreu um erro interno na verificação: {e}"}), 500
 
 if __name__ == '__main__':
-    if not os.path.exists("uploads"):
-        os.makedirs("uploads")
+    # A pasta 'uploads' não é mais necessária para a lógica principal
     create_table()
     app.run(host='0.0.0.0', port=5001, debug=True)
