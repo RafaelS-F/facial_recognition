@@ -1,7 +1,7 @@
-     Flask
+Flask
 Flask-Cors
 gunicorn
 psycopg2-binary
 python-dotenv
 numpy
-opencv-python
+opencv-contrib-python
