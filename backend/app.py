@@ -3,19 +3,17 @@ import psycopg2
 import json
 import numpy as np
 import cv2
-import face_recognition # MUDANÇA: Importar a nova biblioteca
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
 
 load_dotenv()
-
 app = Flask(__name__)
-# Deixando o CORS mais aberto para testes, pode ser restringido depois se necessário
-CORS(app)
+CORS(app) 
 
-# --- O código do banco de dados permanece o mesmo ---
+# --- Banco de Dados (agora armazenaremos a imagem) ---
 def get_db_connection():
+    # ... (código do banco de dados permanece o mesmo)
     try:
         conn = psycopg2.connect(os.getenv('DATABASE_URL'))
         return conn
@@ -27,12 +25,13 @@ def create_table():
     conn = get_db_connection()
     if conn:
         with conn.cursor() as cur:
+            # MUDANÇA: O campo 'embedding' agora será 'face_image' do tipo BYTEA para guardar a imagem
             cur.execute("""
             CREATE TABLE IF NOT EXISTS passengers (
                 id SERIAL PRIMARY KEY,
                 name VARCHAR(255) NOT NULL,
                 document_id VARCHAR(50) UNIQUE NOT NULL,
-                embedding JSONB NOT NULL,
+                face_image BYTEA NOT NULL, 
                 created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
             );
             """)
@@ -40,19 +39,23 @@ def create_table():
         conn.close()
         print("Tabela 'passengers' verificada/criada com sucesso.")
 
-# MUDANÇA: O NumpyEncoder não é mais estritamente necessário, mas podemos manter por segurança
-class NumpyEncoder(json.JSONEncoder):
-    def default(self, obj):
-        if isinstance(obj, np.ndarray):
-            return obj.tolist()
-        return json.JSONEncoder.default(self, obj)
+# --- Helpers de Imagem com OpenCV ---
+# Carrega o classificador de detecção de rosto do OpenCV
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 
-def process_image_in_memory(photo_file):
-    file_bytes = np.fromfile(photo_file, np.uint8)
+def process_and_detect_face(photo_file):
+    file_bytes = np.frombuffer(photo_file.read(), np.uint8)
     img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-    # MUDANÇA: face_recognition espera cores RGB, enquanto OpenCV lê em BGR. Precisamos converter.
-    rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    return rgb_img
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    
+    faces = face_cascade.detectMultiScale(gray, 1.1, 4)
+    if len(faces) == 0:
+        return None, None # Retorna None se nenhum rosto for encontrado
+    
+    # Extrai a região do primeiro rosto encontrado
+    (x, y, w, h) = faces[0]
+    face_roi = gray[y:y+h, x:x+w]
+    return face_roi, file_bytes # Retorna o rosto e os bytes originais da imagem
 
 @app.route('/api/register', methods=['POST'])
 def register_passenger():
@@ -63,37 +66,25 @@ def register_passenger():
     document_id = request.form['document_id']
     photo = request.files['photo']
 
+    # Detecta o rosto para garantir que a imagem é válida
+    face_roi, original_image_bytes = process_and_detect_face(photo)
+    if face_roi is None:
+        return jsonify({"error": "Nenhum rosto detectado na imagem de cadastro."}), 400
+
     try:
-        img = process_image_in_memory(photo)
-        
-        # MUDANÇA: Lógica de representação com face_recognition
-        # Retorna uma lista de encodings (um para cada rosto na imagem)
-        face_encodings = face_recognition.face_encodings(img)
-
-        if len(face_encodings) == 0:
-            return jsonify({"error": "Nenhum rosto encontrado na imagem."}), 400
-        
-        # Pega o encoding do primeiro rosto encontrado
-        embedding = face_encodings[0]
-        embedding_json = json.dumps(embedding, cls=NumpyEncoder)
-
         conn = get_db_connection()
-        if not conn:
-            return jsonify({"error": "Falha na conexão com o banco de dados"}), 500
-        
         with conn.cursor() as cur:
+            # MUDANÇA: Salva os bytes da imagem original no banco
             cur.execute(
-                "INSERT INTO passengers (name, document_id, embedding) VALUES (%s, %s, %s)",
-                (name, document_id, embedding_json)
+                "INSERT INTO passengers (name, document_id, face_image) VALUES (%s, %s, %s)",
+                (name, document_id, psycopg2.Binary(original_image_bytes))
             )
         conn.commit()
         conn.close()
-
         return jsonify({"message": f"Passageiro {name} registrado com sucesso!"}), 201
-
     except Exception as e:
-        print(f"Erro inesperado: {e}")
-        return jsonify({"error": f"Ocorreu um erro interno: {e}"}), 500
+        print(f"Erro no registro: {e}")
+        return jsonify({"error": "Ocorreu um erro interno durante o registro."}), 500
 
 @app.route('/api/verify', methods=['POST'])
 def verify_passenger():
@@ -102,48 +93,51 @@ def verify_passenger():
 
     document_id = request.form['document_id']
     photo = request.files['photo']
-    
+
     try:
-        live_img = process_image_in_memory(photo)
-        live_encodings = face_recognition.face_encodings(live_img)
+        # Pega a imagem ao vivo e detecta o rosto
+        live_face_roi, _ = process_and_detect_face(photo)
+        if live_face_roi is None:
+            return jsonify({"error": "Nenhum rosto detectado na imagem de verificação."}), 400
 
-        if len(live_encodings) == 0:
-            return jsonify({"error": "Nenhum rosto encontrado na imagem para verificação."}), 400
-        
-        live_embedding = live_encodings[0]
-
+        # Busca a imagem de cadastro no banco
         conn = get_db_connection()
-        # ... (código para buscar dados no banco continua o mesmo)
         with conn.cursor() as cur:
-            cur.execute("SELECT name, embedding FROM passengers WHERE document_id = %s", (document_id,))
+            cur.execute("SELECT name, face_image FROM passengers WHERE document_id = %s", (document_id,))
             result = cur.fetchone()
-            if result:
-                passenger_name, db_embedding = result
-            else:
-                return jsonify({"error": "Passageiro não encontrado"}), 404
+            if not result:
+                return jsonify({"error": "Passageiro não encontrado."}), 404
+            passenger_name, db_image_bytes = result
         conn.close()
 
-        # MUDANÇA: Lógica de verificação com face_recognition
-        # `compare_faces` retorna uma lista de True/False
-        matches = face_recognition.compare_faces([db_embedding], live_embedding, tolerance=0.6)
-        verified = matches[0]
+        # Detecta o rosto na imagem do banco de dados
+        db_face_roi, _ = process_and_detect_face(db_image_bytes)
+        if db_face_roi is None:
+             return jsonify({"error": "Não foi possível encontrar um rosto na imagem de cadastro."}), 500
 
-        # `face_distance` nos dá um valor numérico para a similaridade
-        # Distância menor = mais parecido. 0 é idêntico.
-        distance = face_recognition.face_distance([db_embedding], live_embedding)[0]
-        # Convertendo distância para uma porcentagem de similaridade (forma simples)
-        similarity_percentage = (1 - distance) * 100
+        # Treina o modelo LBPH com a imagem do banco
+        recognizer = cv2.face.LBPHFaceRecognizer_create()
+        # O modelo precisa de um ID para cada pessoa, usaremos 1 como padrão
+        recognizer.train([db_face_roi], np.array([1]))
+
+        # Tenta reconhecer o rosto da imagem ao vivo
+        label, confidence = recognizer.predict(live_face_roi)
+
+        # Avalia o resultado
+        # A 'confiança' do LBPH é na verdade uma 'distância'. Menor é melhor.
+        # Um bom limiar (threshold) é em torno de 50-80.
+        verified = confidence < 80 
+        similarity_percentage = max(0, 100 - confidence) # Conversão simples para porcentagem
 
         return jsonify({
-            "verified": bool(verified), # Converte de numpy.bool_ para bool nativo
-            "similarity_percentage": f"{similarity_percentage:.2f}%",
+            "verified": bool(verified),
+            "similarity_percentage": f"{similarity_percentage:.2f}% (Distância: {confidence:.2f})",
             "passenger_name": passenger_name,
             "document_id": document_id
         }), 200
-
     except Exception as e:
-        print(f"Erro inesperado na verificação: {e}")
-        return jsonify({"error": f"Ocorreu um erro interno na verificação: {e}"}), 500
+        print(f"Erro na verificação: {e}")
+        return jsonify({"error": "Ocorreu um erro interno durante a verificação."}), 500
 
 if __name__ == '__main__':
     create_table()

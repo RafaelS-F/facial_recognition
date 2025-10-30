@@ -1,5 +1,3 @@
-# Arquivo: backend/requirements.txt
-
 Flask
 Flask-Cors
 gunicorn
@@ -7,5 +5,3 @@ psycopg2-binary
 python-dotenv
 numpy
 opencv-python
-face_recognition
-dlib
