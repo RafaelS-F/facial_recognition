@@ -10,7 +10,7 @@ load_dotenv()
 app = Flask(__name__)
 CORS(app) 
 
-# --- Banco de Dados ---
+# --- Banco de Dados (sem alterações aqui) ---
 def get_db_connection():
     try:
         conn = psycopg2.connect(os.getenv('DATABASE_URL'))
@@ -39,14 +39,22 @@ def create_table():
 # --- Helpers de Imagem com OpenCV ---
 face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 
-def process_and_detect_face(photo_file):
-    # Lida com bytes da memória (db) ou um arquivo (upload)
-    if isinstance(photo_file, bytes):
-        file_bytes = np.frombuffer(photo_file, np.uint8)
-    else:
-        file_bytes = np.frombuffer(photo_file.read(), np.uint8)
+# --- ESTA FUNÇÃO FOI CORRIGIDA ---
+def process_and_detect_face(image_data):
+    # Verifica se o dado é um arquivo de upload ou bytes do banco de dados
+    if hasattr(image_data, 'read'): # É um arquivo de upload
+        file_bytes_raw = image_data.read()
+    else: # São bytes do banco de dados
+        file_bytes_raw = image_data
     
-    img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+    # Converte os bytes brutos para um array numpy
+    file_bytes_np = np.frombuffer(file_bytes_raw, np.uint8)
+    
+    # Decodifica para uma imagem OpenCV
+    img = cv2.imdecode(file_bytes_np, cv2.IMREAD_COLOR)
+    if img is None:
+        return None, None
+
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     
     faces = face_cascade.detectMultiScale(gray, 1.1, 4)
@@ -56,18 +64,13 @@ def process_and_detect_face(photo_file):
     (x, y, w, h) = faces[0]
     face_roi = gray[y:y+h, x:x+w]
     
-    # Retorna o rosto e os bytes originais da imagem para o cadastro
-    if not isinstance(photo_file, bytes):
-         photo_file.seek(0) # Reseta o ponteiro do arquivo
-         return face_roi, photo_file.read()
+    # Retorna o rosto detectado e os bytes originais da imagem para o cadastro
+    return face_roi, file_bytes_raw
+# --- FIM DA CORREÇÃO ---
 
-    return face_roi, photo_file
-
-
-# --- ROTAS DA API ---
-# ... (O código das rotas @app.route permanece o mesmo)
 @app.route('/api/register', methods=['POST'])
 def register_passenger():
+    # ... (sem alterações nesta função)
     if 'photo' not in request.files or 'name' not in request.form or 'document_id' not in request.form:
         return jsonify({"error": "Dados incompletos"}), 400
 
@@ -95,6 +98,7 @@ def register_passenger():
 
 @app.route('/api/verify', methods=['POST'])
 def verify_passenger():
+    # ... (sem alterações nesta função)
     if 'photo' not in request.files or 'document_id' not in request.form:
         return jsonify({"error": "Dados incompletos"}), 400
 
@@ -111,6 +115,7 @@ def verify_passenger():
             cur.execute("SELECT name, face_image FROM passengers WHERE document_id = %s", (document_id,))
             result = cur.fetchone()
             if not result:
+                conn.close()
                 return jsonify({"error": "Passageiro não encontrado."}), 404
             passenger_name, db_image_bytes = result
         conn.close()
@@ -136,10 +141,7 @@ def verify_passenger():
         print(f"Erro na verificação: {e}")
         return jsonify({"error": "Ocorreu um erro interno durante a verificação."}), 500
 
-
 # --- INICIALIZAÇÃO DA APLICAÇÃO ---
-
-# MUDANÇA CRÍTICA: Chame a função aqui para garantir que ela rode na Render
 create_table()
 
 if __name__ == '__main__':
