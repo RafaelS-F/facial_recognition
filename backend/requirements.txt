@@ -1,7 +1,11 @@
+# Arquivo: backend/requirements.txt
+
 Flask
 Flask-Cors
 gunicorn
 psycopg2-binary
 python-dotenv
 numpy
-opencv-contrib-python
+opencv-python
+deepface
+tf-keras
